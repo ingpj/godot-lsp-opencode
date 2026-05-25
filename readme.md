@@ -3,6 +3,11 @@
 ![](.images/2026-05-25-12-45-18.png)
 ![](.images/2026-05-25-12-48-58.png)
 
+## app version
+- godot 4.6.2
+- opencode v1.15.10
+- node v22.22.2
+
 ## opencode
 ```json
 {
