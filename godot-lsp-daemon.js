@@ -39,7 +39,7 @@ for (let i = 0; i < args.length; i++) {
 // ─── 日志 ────────────────────────────────────────────────────────────────────
 
 function log(msg) {
-    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    const line = `[${new Date().toLocaleString()}] ${msg}\n`;
     process.stderr.write(line);
     fs.appendFileSync(logFile, line);
 }
@@ -57,33 +57,14 @@ function findProjectRoot(startDir) {
     return null;
 }
 
-function isPortOpen(port, host) {
-    return new Promise((resolve) => {
-        const s = new net.Socket();
-        s.setTimeout(1000);
-        s.once("connect", () => {
-            s.destroy();
-            resolve(true);
-        });
-        s.once("timeout", () => {
-            s.destroy();
-            resolve(false);
-        });
-        s.once("error", () => {
-            s.destroy();
-            resolve(false);
-        });
-        s.connect(port, host);
-    });
-}
-
 // ─── Godot 启动 ──────────────────────────────────────────────────────────────
 
 async function ensureGodotRunning() {
-    if (await isPortOpen(godotPort, godotHost)) {
+    try {
+        await connectToGodot();
         log(`Godot LSP already running on ${godotPort}`);
         return;
-    }
+    } catch (_) {}
 
     const root = projectRoot || findProjectRoot(process.cwd());
     if (!root) {
@@ -109,10 +90,12 @@ async function ensureGodotRunning() {
     child.unref();
 
     for (let i = 0; i < 40; i++) {
-        await new Promise((r) => setTimeout(r, 500));
-        if (await isPortOpen(godotPort, godotHost)) {
+        try {
+            await connectToGodot();
             log("Godot LSP ready");
             return;
+        } catch (_) {
+            await new Promise((r) => setTimeout(r, 500));
         }
     }
 
@@ -127,37 +110,56 @@ async function ensureGodotRunning() {
 // 新 client 连入时会取代旧 client 接收 Godot 的响应。
 
 let godotSocket = null;
-let activeClient = null; // 当前接收 Godot 数据的 bridge client
+let activeClient = null;
+let godotConnecting = null;
 
 function connectToGodot() {
-    if (godotSocket) return;
+    if (godotSocket && !godotSocket.destroyed) return Promise.resolve();
+    if (godotConnecting) return godotConnecting;
 
-    const sock = new net.Socket();
+    godotConnecting = new Promise((resolve, reject) => {
+        const sock = new net.Socket();
 
-    sock.connect(godotPort, godotHost, () => {
-        log(`Connected to Godot LSP ${godotHost}:${godotPort}`);
-        godotSocket = sock;
+        const timeout = setTimeout(() => {
+            sock.destroy();
+            godotConnecting = null;
+            reject(new Error("Godot connection timed out"));
+        }, 10000);
+
+        sock.connect(godotPort, godotHost, () => {
+            clearTimeout(timeout);
+            log(`Connected to Godot LSP ${godotHost}:${godotPort}`);
+            godotSocket = sock;
+            godotConnecting = null;
+            resolve();
+        });
+
+        sock.on("data", (chunk) => {
+            if (activeClient && !activeClient.destroyed) {
+                activeClient.write(chunk);
+            }
+        });
+
+        sock.on("error", (err) => {
+            clearTimeout(timeout);
+            log(`Godot socket error: ${err.message}`);
+            godotSocket = null;
+            godotConnecting = null;
+            setTimeout(() => { connectToGodot(); }, 3000);
+            reject(err);
+        });
+
+        sock.on("close", () => {
+            clearTimeout(timeout);
+            log("Godot socket closed, will reconnect in 3s");
+            godotSocket = null;
+            godotConnecting = null;
+            setTimeout(() => { connectToGodot(); }, 3000);
+            reject(new Error("Connection closed"));
+        });
     });
 
-    sock.on("data", (chunk) => {
-        // 转发给当前活跃的 bridge client
-        if (activeClient && !activeClient.destroyed) {
-            activeClient.write(chunk);
-        }
-    });
-
-    sock.on("error", (err) => {
-        log(`Godot socket error: ${err.message}`);
-        godotSocket = null;
-        // 3 秒后重连
-        setTimeout(connectToGodot, 3000);
-    });
-
-    sock.on("close", () => {
-        log("Godot socket closed, will reconnect in 3s");
-        godotSocket = null;
-        setTimeout(connectToGodot, 3000);
-    });
+    return godotConnecting;
 }
 
 // ─── LSP 消息重写 ─────────────────────────────────────────────────────────────
@@ -193,7 +195,7 @@ function handleBridgeClient(client) {
 
     let buf = Buffer.alloc(0);
 
-    client.on("data", (chunk) => {
+    client.on("data", async (chunk) => {
         buf = Buffer.concat([buf, chunk]);
 
         while (true) {
@@ -216,10 +218,13 @@ function handleBridgeClient(client) {
             const rewritten = rewriteIfNeeded(body);
             const packet = makeLspPacket(rewritten);
 
-            if (godotSocket && !godotSocket.destroyed) {
-                godotSocket.write(packet);
-            } else {
-                log("WARNING: no Godot connection, dropping message");
+            try {
+                await connectToGodot();
+                if (godotSocket && !godotSocket.destroyed) {
+                    godotSocket.write(packet);
+                }
+            } catch (err) {
+                log(`ERROR: cannot forward to Godot: ${err.message}`);
             }
 
             buf = buf.slice(bodyEnd);
@@ -242,13 +247,6 @@ async function main() {
     log(`=== godot-lsp-daemon starting (daemon port: ${daemonPort}) ===`);
 
     await ensureGodotRunning();
-    connectToGodot();
-
-    // 等待 Godot socket 连接成功（最多 3 秒）
-    for (let i = 0; i < 30; i++) {
-        if (godotSocket) break;
-        await new Promise((r) => setTimeout(r, 100));
-    }
 
     const server = net.createServer(handleBridgeClient);
 

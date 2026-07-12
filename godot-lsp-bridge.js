@@ -34,7 +34,7 @@ for (let i = 0; i < args.length; i++) {
 // ─── 日志 ────────────────────────────────────────────────────────────────────
 
 function log(msg) {
-    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    const line = `[${new Date().toLocaleString()}] ${msg}\n`;
     process.stderr.write(line);
     fs.appendFileSync(logFile, line);
 }
