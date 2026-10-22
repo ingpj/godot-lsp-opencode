@@ -57,6 +57,97 @@ function findProjectRoot(startDir) {
     return null;
 }
 
+function makeLspPacket(body) {
+    const header = `Content-Length: ${body.length}\r\n\r\n`;
+    return Buffer.concat([Buffer.from(header, "ascii"), body]);
+}
+
+// 按 LSP 帧切分字节流，每得到一条完整消息就解析 JSON 并回调
+class LspFramer {
+    constructor(onMessage) {
+        this.buf = Buffer.alloc(0);
+        this.onMessage = onMessage;
+    }
+
+    feed(chunk) {
+        this.buf = Buffer.concat([this.buf, chunk]);
+        while (true) {
+            const headerEnd = this.buf.indexOf("\r\n\r\n");
+            if (headerEnd === -1) break;
+
+            const m = this.buf.slice(0, headerEnd).toString("ascii").match(/Content-Length:\s*(\d+)/i);
+            if (!m) {
+                this.buf = Buffer.alloc(0);
+                break;
+            }
+
+            const bodyStart = headerEnd + 4;
+            const bodyEnd = bodyStart + parseInt(m[1], 10);
+            if (this.buf.length < bodyEnd) break;
+
+            const body = this.buf.slice(bodyStart, bodyEnd);
+            this.buf = this.buf.slice(bodyEnd);
+
+            let msg;
+            try {
+                msg = JSON.parse(body.toString("utf8"));
+            } catch (err) {
+                log(`ERROR: invalid JSON frame: ${err.message}`);
+                continue;
+            }
+            if (msg && typeof msg === "object") this.onMessage(msg);
+        }
+    }
+}
+
+function sendPacket(sock, obj) {
+    if (!sock || sock.destroyed) return false;
+    sock.write(makeLspPacket(Buffer.from(JSON.stringify(obj), "utf8")));
+    return true;
+}
+
+// ─── 全局状态 ────────────────────────────────────────────────────────────────
+//
+// 单条 Godot TCP 长连接，多个 bridge 客户端共享。
+// - 请求 id 改写为 daemon 自增的 godotId，pending 记录原始 (clientId, origId)，
+//   Godot 响应回来后还原 id 只发给对应客户端。
+// - initialize 只真正发给 Godot 一次，结果缓存；之后的 initialize 直接返回缓存。
+// - initialized 只转发一次；exit 不转发；shutdown 由 daemon 本地应答。
+// - 不记录文档打开状态；文档同步通知原样转发，Godot 通知广播给所有客户端。
+
+let godotSocket = null;
+let godotConnecting = null;
+
+let nextGodotId = 1;
+let nextClientId = 1;
+const clients = new Map(); // clientId -> { id, socket }
+const pending = new Map(); // godotId -> { clientId, origId, kind: "req" | "init" }
+let godotInitResult = null;
+let godotInitialized = false;
+let initInFlight = false;
+let initWaiters = []; // [{ clientId, origId }]
+
+// 串行处理客户端消息，保证 initialize / didOpen 等顺序
+let queue = Promise.resolve();
+function enqueue(fn) {
+    queue = queue
+        .then(fn)
+        .catch((err) => log(`ERROR: ${err.stack || err.message}`));
+}
+
+function sendToClient(client, obj) {
+    if (!client || !clients.has(client.id)) return;
+    sendPacket(client.socket, obj);
+}
+
+function sendToGodot(obj) {
+    return sendPacket(godotSocket, obj);
+}
+
+function sendError(client, id, message) {
+    sendToClient(client, { jsonrpc: "2.0", id, error: { code: -32603, message } });
+}
+
 // ─── Godot 启动 ──────────────────────────────────────────────────────────────
 
 async function ensureGodotRunning() {
@@ -77,14 +168,7 @@ async function ensureGodotRunning() {
 
     const child = spawn(
         godotPath,
-        [
-            "--editor",
-            "--headless",
-            "--lsp-port",
-            String(godotPort),
-            "--path",
-            root,
-        ],
+        ["--editor", "--headless", "--lsp-port", String(godotPort), "--path", root],
         { detached: true, stdio: "ignore" },
     );
     child.unref();
@@ -103,15 +187,38 @@ async function ensureGodotRunning() {
     process.exit(1);
 }
 
-// ─── Godot 连接管理 ──────────────────────────────────────────────────────────
-//
-// 只维持一条到 Godot 的 TCP 连接。
-// 当前只支持一个活跃 client（Godot LSP 本身也只支持单客户端），
-// 新 client 连入时会取代旧 client 接收 Godot 的响应。
+async function ensureGodot() {
+    try {
+        await connectToGodot();
+        return true;
+    } catch (err) {
+        log(`ERROR: cannot reach Godot: ${err.message}`);
+        return false;
+    }
+}
 
-let godotSocket = null;
-let activeClient = null;
-let godotConnecting = null;
+// ─── Godot 连接管理 ──────────────────────────────────────────────────────────
+
+// Godot 连接断开：通知所有等待中的客户端，并清空与该会话绑定的状态。
+// 下次有请求时 ensureGodot 会重新连接，但 Godot 端的 LSP 会话是新的，
+// 已连接的客户端需要重新 initialize（这是已知限制）。
+function onGodotDown(sock) {
+    if (godotSocket !== sock) return;
+    godotSocket = null;
+    log("Godot connection lost; resetting session state");
+
+    for (const [gid, p] of pending) {
+        sendError(clients.get(p.clientId), p.origId, "Godot LSP connection lost");
+        pending.delete(gid);
+    }
+    for (const w of initWaiters) {
+        sendError(clients.get(w.clientId), w.origId, "Godot LSP connection lost");
+    }
+    initWaiters = [];
+    initInFlight = false;
+    godotInitResult = null;
+    godotInitialized = false;
+}
 
 function connectToGodot() {
     if (godotSocket && !godotSocket.destroyed) return Promise.resolve();
@@ -119,6 +226,7 @@ function connectToGodot() {
 
     godotConnecting = new Promise((resolve, reject) => {
         const sock = new net.Socket();
+        const framer = new LspFramer(onGodotMessage);
 
         const timeout = setTimeout(() => {
             sock.destroy();
@@ -134,27 +242,21 @@ function connectToGodot() {
             resolve();
         });
 
-        sock.on("data", (chunk) => {
-            if (activeClient && !activeClient.destroyed) {
-                activeClient.write(chunk);
-            }
-        });
+        sock.on("data", (chunk) => framer.feed(chunk));
 
         sock.on("error", (err) => {
             clearTimeout(timeout);
             log(`Godot socket error: ${err.message}`);
-            godotSocket = null;
+            onGodotDown(sock);
             godotConnecting = null;
-            setTimeout(() => { connectToGodot(); }, 3000);
             reject(err);
         });
 
         sock.on("close", () => {
             clearTimeout(timeout);
-            log("Godot socket closed, will reconnect in 3s");
-            godotSocket = null;
+            log("Godot socket closed");
+            onGodotDown(sock);
             godotConnecting = null;
-            setTimeout(() => { connectToGodot(); }, 3000);
             reject(new Error("Connection closed"));
         });
     });
@@ -162,83 +264,171 @@ function connectToGodot() {
     return godotConnecting;
 }
 
-// ─── LSP 消息重写 ─────────────────────────────────────────────────────────────
+// ─── Godot → 客户端 ──────────────────────────────────────────────────────────
 
-function rewriteIfNeeded(buf) {
-    try {
-        const json = JSON.parse(buf.toString("utf8"));
-        if (json?.params?.textDocument?.languageId === "plaintext") {
-            json.params.textDocument.languageId = "gdscript";
-            log("rewrite: plaintext → gdscript");
-            return Buffer.from(JSON.stringify(json), "utf8");
+function finishInit(p, msg) {
+    initInFlight = false;
+    if (msg.result !== undefined) godotInitResult = msg.result;
+
+    const targets = [{ clientId: p.clientId, origId: p.origId }, ...initWaiters];
+    initWaiters = [];
+    for (const t of targets) {
+        const client = clients.get(t.clientId);
+        if (!client) continue;
+        if (msg.error) {
+            sendToClient(client, { jsonrpc: "2.0", id: t.origId, error: msg.error });
+        } else {
+            sendToClient(client, { jsonrpc: "2.0", id: t.origId, result: msg.result });
         }
-    } catch (_) {}
-    return buf;
+    }
+    log(`initialize completed; answered ${targets.length} client(s)`);
 }
 
-function makeLspPacket(body) {
-    const header = `Content-Length: ${body.length}\r\n\r\n`;
-    return Buffer.concat([Buffer.from(header, "ascii"), body]);
+function onGodotMessage(msg) {
+    const hasId = msg.id !== undefined && msg.id !== null;
+
+    // 对 daemon 发出的请求的响应
+    if (msg.method === undefined && hasId) {
+        const p = pending.get(msg.id);
+        if (!p) {
+            log(`WARN: response for unknown id ${msg.id}`);
+            return;
+        }
+        pending.delete(msg.id);
+        if (p.kind === "init") return finishInit(p, msg);
+
+        const client = clients.get(p.clientId);
+        if (!client) {
+            log(`drop response for id ${p.origId}: client gone`);
+            return;
+        }
+        sendToClient(client, { ...msg, id: p.origId });
+        return;
+    }
+
+    // Godot 发给客户端的请求（如 workspace/configuration）：交给最早连入的客户端，
+    // 客户端的响应会原样转回 Godot
+    if (msg.method !== undefined && hasId) {
+        const client = clients.values().next().value;
+        if (!client) {
+            log(`WARN: server request ${msg.method} with no client`);
+            return;
+        }
+        sendToClient(client, msg);
+        return;
+    }
+
+    // 不跟踪文档打开状态，Godot 通知广播给当前客户端。
+    for (const c of clients.values()) sendToClient(c, msg);
+}
+
+// ─── 客户端 → Godot ──────────────────────────────────────────────────────────
+
+function findGodotId(clientId, origId) {
+    for (const [gid, p] of pending) {
+        if (p.clientId === clientId && p.origId === origId) return gid;
+    }
+    return undefined;
+}
+
+async function handleInitialize(client, msg) {
+    if (godotInitResult) {
+        sendToClient(client, { jsonrpc: "2.0", id: msg.id, result: godotInitResult });
+        return;
+    }
+    if (initInFlight) {
+        initWaiters.push({ clientId: client.id, origId: msg.id });
+        return;
+    }
+    if (!(await ensureGodot())) {
+        sendError(client, msg.id, "Godot LSP not connected");
+        return;
+    }
+    initInFlight = true;
+    const gid = nextGodotId++;
+    pending.set(gid, { clientId: client.id, origId: msg.id, kind: "init" });
+    log(`initialize forwarded for client #${client.id}`);
+    sendToGodot({ ...msg, id: gid });
+}
+
+async function handleClientMessage(client, msg) {
+    if (!clients.has(client.id)) return;
+
+    // 重写 plaintext languageId
+    if (msg?.params?.textDocument?.languageId === "plaintext") {
+        msg.params.textDocument.languageId = "gdscript";
+        log("rewrite: plaintext → gdscript");
+    }
+
+    const hasId = msg.id !== undefined && msg.id !== null;
+
+    // 客户端对 Godot 请求的响应：原样转回
+    if (msg.method === undefined) {
+        if (await ensureGodot()) sendToGodot(msg);
+        return;
+    }
+
+    if (msg.method === "initialize" && hasId) return handleInitialize(client, msg);
+
+    if (msg.method === "shutdown" && hasId) {
+        sendToClient(client, { jsonrpc: "2.0", id: msg.id, result: null });
+        return;
+    }
+
+    if (msg.method === "exit") {
+        // 单个 bridge 退出不能结束 daemon 与 Godot 的会话
+        log(`exit from client #${client.id} ignored`);
+        return;
+    }
+
+    if (msg.method === "initialized") {
+        if (!godotInitResult || godotInitialized) return;
+        if (!(await ensureGodot())) return;
+        godotInitialized = true;
+        sendToGodot(msg);
+        return;
+    }
+
+    if (msg.method === "$/cancelRequest") {
+        const gid = findGodotId(client.id, msg.params?.id);
+        if (gid !== undefined && (await ensureGodot())) {
+            sendToGodot({ jsonrpc: "2.0", method: msg.method, params: { id: gid } });
+        }
+        return;
+    }
+
+    if (hasId) {
+        if (!(await ensureGodot())) {
+            sendError(client, msg.id, "Godot LSP not connected");
+            return;
+        }
+        const gid = nextGodotId++;
+        pending.set(gid, { clientId: client.id, origId: msg.id, kind: "req" });
+        sendToGodot({ ...msg, id: gid });
+        return;
+    }
+
+    if (await ensureGodot()) sendToGodot(msg);
+}
+
+function removeClient(client) {
+    if (!clients.has(client.id)) return;
+    clients.delete(client.id);
+    log(`Bridge client #${client.id} disconnected`);
+    initWaiters = initWaiters.filter((w) => w.clientId !== client.id);
 }
 
 // ─── Bridge client 处理 ──────────────────────────────────────────────────────
-//
-// 每个 bridge 连进来都是一个独立的 TCP socket（来自 opencode stdio bridge）。
-// 我们解析它发来的 LSP 帧，重写后转发给 Godot。
 
-function handleBridgeClient(client) {
-    const addr = `${client.remoteAddress}:${client.remotePort}`;
-    log(`Bridge client connected: ${addr}`);
+function handleBridgeClient(socket) {
+    const client = { id: nextClientId++, socket };
+    clients.set(client.id, client);
+    log(`Bridge client #${client.id} connected: ${socket.remoteAddress}:${socket.remotePort}`);
 
-    // 新 client 成为活跃接收方
-    activeClient = client;
-
-    let buf = Buffer.alloc(0);
-
-    client.on("data", async (chunk) => {
-        buf = Buffer.concat([buf, chunk]);
-
-        while (true) {
-            const headerEnd = buf.indexOf("\r\n\r\n");
-            if (headerEnd === -1) break;
-
-            const headerText = buf.slice(0, headerEnd).toString("ascii");
-            const m = headerText.match(/Content-Length:\s*(\d+)/i);
-            if (!m) {
-                buf = Buffer.alloc(0);
-                break;
-            }
-
-            const contentLength = parseInt(m[1], 10);
-            const bodyStart = headerEnd + 4;
-            const bodyEnd = bodyStart + contentLength;
-            if (buf.length < bodyEnd) break;
-
-            const body = buf.slice(bodyStart, bodyEnd);
-            const rewritten = rewriteIfNeeded(body);
-            const packet = makeLspPacket(rewritten);
-
-            try {
-                await connectToGodot();
-                if (godotSocket && !godotSocket.destroyed) {
-                    godotSocket.write(packet);
-                }
-            } catch (err) {
-                log(`ERROR: cannot forward to Godot: ${err.message}`);
-            }
-
-            buf = buf.slice(bodyEnd);
-        }
-    });
-
-    client.on("close", () => {
-        log(`Bridge client disconnected: ${addr}`);
-        if (activeClient === client) activeClient = null;
-    });
-
-    client.on("error", (err) => {
-        log(`Bridge client error (${addr}): ${err.message}`);
-    });
+    const framer = new LspFramer((msg) => enqueue(() => handleClientMessage(client, msg)));
+    socket.on("data", (chunk) => framer.feed(chunk));
+    socket.on("close", () => enqueue(() => removeClient(client)));
+    socket.on("error", (err) => log(`Bridge client #${client.id} error: ${err.message}`));
 }
 
 // ─── 主流程 ──────────────────────────────────────────────────────────────────
