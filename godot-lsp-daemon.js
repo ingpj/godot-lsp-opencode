@@ -17,6 +17,8 @@ let daemonPort = 7006; // daemon 自己监听的端口，bridge 连这里
 let godotPath = "/Applications/Godot.app/Contents/MacOS/Godot";
 let projectRoot = null; // 可手动指定，否则从 cwd 向上查找
 let logFile = path.join(require("os").homedir(), "godot-lsp-daemon.log");
+const GODOT_RECONNECT_MAX_ATTEMPTS = 10;
+const GODOT_RECONNECT_INTERVAL_MS = 3000;
 
 for (let i = 0; i < args.length; i++) {
     if (args[i] === "--godot" && args[i + 1]) {
@@ -113,7 +115,8 @@ function sendPacket(sock, obj) {
 //   Godot 响应回来后还原 id 只发给对应客户端。
 // - initialize 只真正发给 Godot 一次，结果缓存；之后的 initialize 直接返回缓存。
 // - initialized 只转发一次；exit 不转发；shutdown 由 daemon 本地应答。
-// - 不记录文档打开状态；文档同步通知原样转发，Godot 通知广播给所有客户端。
+// - 只记录当前 Godot 会话的已打开 URI，以满足 didOpen/didChange/didClose 生命周期；
+//   不缓存查询结果，也不在连接恢复时重放文档。
 
 let godotSocket = null;
 let godotConnecting = null;
@@ -126,6 +129,11 @@ let godotInitResult = null;
 let godotInitialized = false;
 let initInFlight = false;
 let initWaiters = []; // [{ clientId, origId }]
+let lastInitializeMsg = null;
+let lastInitializedMsg = null;
+let godotRecoveryPromise = null;
+let godotRecoveryExhausted = false;
+const openDocs = new Set(); // URI currently opened in this Godot TCP session
 
 // 串行处理客户端消息，保证 initialize / didOpen 等顺序
 let queue = Promise.resolve();
@@ -188,6 +196,8 @@ async function ensureGodotRunning() {
 }
 
 async function ensureGodot() {
+    if (godotRecoveryPromise) return godotRecoveryPromise;
+    if (godotRecoveryExhausted) return false;
     try {
         await connectToGodot();
         return true;
@@ -197,17 +207,82 @@ async function ensureGodot() {
     }
 }
 
+function initializeRecoveredGodotSession() {
+    if (!lastInitializeMsg) return Promise.resolve();
+
+    const id = nextGodotId++;
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            if (!pending.has(id)) return;
+            pending.delete(id);
+            reject(new Error("Godot reinitialize timed out"));
+        }, 10000);
+        const reconnectInit = {
+            kind: "reconnect-init",
+            resolve: () => {
+                clearTimeout(timeout);
+                resolve();
+            },
+            reject: (err) => {
+                clearTimeout(timeout);
+                reject(err);
+            },
+        };
+        pending.set(id, reconnectInit);
+        if (!sendToGodot({ ...lastInitializeMsg, id })) {
+            pending.delete(id);
+            reconnectInit.reject(new Error("Godot socket unavailable during reinitialize"));
+            return;
+        }
+        log("Reinitializing LSP session after Godot reconnect");
+    });
+}
+
+async function reconnectGodotWithRetries() {
+    for (let attempt = 1; attempt <= GODOT_RECONNECT_MAX_ATTEMPTS; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, GODOT_RECONNECT_INTERVAL_MS));
+        log(`Godot reconnect attempt ${attempt}/${GODOT_RECONNECT_MAX_ATTEMPTS}`);
+
+        try {
+            await connectToGodot();
+            await initializeRecoveredGodotSession();
+            godotRecoveryExhausted = false;
+            log("Godot LSP reconnected and session restored");
+            return true;
+        } catch (err) {
+            log(`Godot reconnect attempt ${attempt} failed: ${err.message}`);
+            if (godotSocket && !godotSocket.destroyed) godotSocket.destroy();
+        }
+    }
+
+    godotRecoveryExhausted = true;
+    log(`Godot reconnect stopped after ${GODOT_RECONNECT_MAX_ATTEMPTS} attempts`);
+    return false;
+}
+
+function startGodotReconnect() {
+    if (godotRecoveryPromise) return;
+    godotRecoveryExhausted = false;
+    godotRecoveryPromise = reconnectGodotWithRetries().finally(() => {
+        godotRecoveryPromise = null;
+    });
+}
+
 // ─── Godot 连接管理 ──────────────────────────────────────────────────────────
 
-// Godot 连接断开：通知所有等待中的客户端，并清空与该会话绑定的状态。
-// 下次有请求时 ensureGodot 会重新连接，但 Godot 端的 LSP 会话是新的，
-// 已连接的客户端需要重新 initialize（这是已知限制）。
+// Godot 连接断开：通知等待中的客户端、清空会话状态，并启动后台重连。
 function onGodotDown(sock) {
     if (godotSocket !== sock) return;
     godotSocket = null;
+    openDocs.clear();
     log("Godot connection lost; resetting session state");
 
     for (const [gid, p] of pending) {
+        if (p.kind === "reconnect-init") {
+            pending.delete(gid);
+            p.reject(new Error("Godot connection dropped during reinitialize"));
+            continue;
+        }
         sendError(clients.get(p.clientId), p.origId, "Godot LSP connection lost");
         pending.delete(gid);
     }
@@ -218,6 +293,7 @@ function onGodotDown(sock) {
     initInFlight = false;
     godotInitResult = null;
     godotInitialized = false;
+    startGodotReconnect();
 }
 
 function connectToGodot() {
@@ -295,6 +371,18 @@ function onGodotMessage(msg) {
             return;
         }
         pending.delete(msg.id);
+        if (p.kind === "reconnect-init") {
+            if (msg.error) {
+                p.reject(new Error(msg.error.message || "Godot reinitialize failed"));
+                return;
+            }
+            godotInitResult = msg.result;
+            if (lastInitializedMsg) sendToGodot(lastInitializedMsg);
+            godotInitialized = true;
+            p.resolve();
+            log("Godot LSP initialize handshake restored");
+            return;
+        }
         if (p.kind === "init") return finishInit(p, msg);
 
         const client = clients.get(p.clientId);
@@ -318,7 +406,7 @@ function onGodotMessage(msg) {
         return;
     }
 
-    // 不跟踪文档打开状态，Godot 通知广播给当前客户端。
+    // 文档状态仅用于维护 Godot LSP 生命周期；Godot 通知广播给当前客户端。
     for (const c of clients.values()) sendToClient(c, msg);
 }
 
@@ -332,6 +420,7 @@ function findGodotId(clientId, origId) {
 }
 
 async function handleInitialize(client, msg) {
+    lastInitializeMsg = msg;
     if (godotInitResult) {
         sendToClient(client, { jsonrpc: "2.0", id: msg.id, result: godotInitResult });
         return;
@@ -342,6 +431,10 @@ async function handleInitialize(client, msg) {
     }
     if (!(await ensureGodot())) {
         sendError(client, msg.id, "Godot LSP not connected");
+        return;
+    }
+    if (godotInitResult) {
+        sendToClient(client, { jsonrpc: "2.0", id: msg.id, result: godotInitResult });
         return;
     }
     initInFlight = true;
@@ -382,6 +475,7 @@ async function handleClientMessage(client, msg) {
     }
 
     if (msg.method === "initialized") {
+        lastInitializedMsg = msg;
         if (!godotInitResult || godotInitialized) return;
         if (!(await ensureGodot())) return;
         godotInitialized = true;
@@ -394,6 +488,48 @@ async function handleClientMessage(client, msg) {
         if (gid !== undefined && (await ensureGodot())) {
             sendToGodot({ jsonrpc: "2.0", method: msg.method, params: { id: gid } });
         }
+        return;
+    }
+
+    // Bridge 将每次同步都编码为 didOpen + 完整文本。
+    // Godot 对同一 URI 的 didOpen 严格报错，因此在 daemon 侧按当前
+    // Godot TCP 会话状态转换为 didOpen（首次）或全文 didChange（后续）。
+    if (msg.method === "textDocument/didOpen") {
+        const doc = msg.params?.textDocument;
+        const uri = doc?.uri;
+        if (!uri || typeof doc.text !== "string") {
+            log(`WARN: invalid didOpen from client #${client.id}`);
+            return;
+        }
+        if (!(await ensureGodot())) return;
+
+        if (openDocs.has(uri)) {
+            sendToGodot({
+                jsonrpc: "2.0",
+                method: "textDocument/didChange",
+                params: {
+                    textDocument: { uri, version: doc.version },
+                    contentChanges: [{ text: doc.text }],
+                },
+            });
+            log(`document sync didChange ${uri}`);
+        } else {
+            openDocs.add(uri);
+            sendToGodot(msg);
+            log(`document sync didOpen ${uri}`);
+        }
+        return;
+    }
+
+    if (msg.method === "textDocument/didClose") {
+        const uri = msg.params?.textDocument?.uri;
+        if (!uri || !openDocs.has(uri)) {
+            log(`ignore didClose for unopened URI ${uri || "<missing>"}`);
+            return;
+        }
+        openDocs.delete(uri);
+        sendToGodot(msg);
+        log(`document sync didClose ${uri}`);
         return;
     }
 

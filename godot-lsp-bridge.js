@@ -12,7 +12,8 @@
 //   - 断线时正在等待响应的请求，立即返回 error（initialize 除外，会重新排队）。
 //   - 断线期间到达的新请求排队，最多等待 QUEUE_TIMEOUT_MS，超时返回 error。
 //   - 断线期间的文档变更记入最新文本快照，但不会在重连时批量重放文档。
-//   - 重连后只恢复 LSP 初始化；每次文档请求前，用该请求对应的最新文本重新 didClose/didOpen。
+//   - 重连后只恢复 LSP 初始化；每次文档请求前，把对应 URI 的最新全文同步给 daemon。
+//     daemon 按 Godot 会话状态选择 didOpen 或 didChange，不批量重放文档。
 //   - stdin 关闭（opencode 结束该 LSP 进程）时才退出。
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,12 +159,8 @@ function forwardRequest(msg) {
 }
 
 function sendFreshDocument(uri, doc, reason) {
-    // 每次同步都重新建立文档状态，不向 Godot 发送依赖旧 didOpen 的 didChange。
-    sendToDaemon({
-        jsonrpc: '2.0',
-        method: 'textDocument/didClose',
-        params: { textDocument: { uri } },
-    });
+    // 把最新全文交给 daemon；daemon 根据 Godot 当前会话的文档状态
+    // 选择 didOpen 或全文 didChange，避免重复 didOpen / 无效 didClose。
     sendToDaemon({
         jsonrpc: '2.0',
         method: 'textDocument/didOpen',
@@ -330,8 +327,11 @@ function onClientMessage(msg) {
             break;
         case 'textDocument/didOpen': {
             const td = msg.params.textDocument;
-            documentSnapshots.set(td.uri, { languageId: td.languageId, version: td.version, text: td.text });
-            break;
+            const doc = { languageId: td.languageId, version: td.version, text: td.text };
+            documentSnapshots.set(td.uri, doc);
+            // 将 didOpen 作为当前文档全文同步，由 daemon 按 Godot 会话状态 upsert。
+            if (connected && !waitingReconnectInit) sendFreshDocument(td.uri, doc, 'didOpen');
+            return;
         }
         case 'textDocument/didChange': {
             let d = uri && documentSnapshots.get(uri);
@@ -353,8 +353,8 @@ function onClientMessage(msg) {
                 applyChanges(d, changesToApply);
                 d.version = msg.params.textDocument.version;
             }
-            // Godot 可能在 daemon 重启后尚未 didOpen。用完整快照重开文档，
-            // 不把 OpenCode 的 didChange 原样发给 Godot。
+            // 用完整快照同步文档；daemon 根据 Godot 会话状态选择 didOpen/didChange，
+            // 不把 OpenCode 的增量 didChange 原样发给 Godot。
             if (connected && !waitingReconnectInit && uri && d) {
                 sendFreshDocument(uri, d, 'didChange');
             } else if (connected && !waitingReconnectInit && uri) {
